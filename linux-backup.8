@@ -1,0 +1,87 @@
+.TH LINUX-BACKUP 8 "November 2026" "linux-backup 1.0.0" "System Administration"
+.SH NAME
+linux-backup \- scheduled, logged and verified backups of /etc and /home
+.SH SYNOPSIS
+.B linux-backup
+.I command
+[\fIoptions\fR]
+.SH DESCRIPTION
+.B linux-backup
+controls a cron-driven backup. Each run archives the configured directories with
+.BR tar (1)
+into a date-stamped, gzip-compressed file in the backup directory, logs every step,
+verifies the archive by listing it, sets it to mode 600, and removes archives older
+than the retention period.
+.PP
+Settings live in
+.IR /etc/linux-backup.conf .
+The cron entry in
+.I /etc/cron.d/linux-backup
+is generated from that file and should not be edited by hand.
+.SH COMMANDS
+.TP
+.B status
+Show whether scheduled backups are enabled, the schedule, the retention period,
+whether crond is running, how many archives exist and the last logged result.
+.TP
+.B enable
+Turn scheduled backups on.
+.TP
+.B disable
+Turn scheduled backups off. Existing archives are kept. A backup that is already
+running finishes normally.
+.TP
+.B schedule
+Print the current schedule.
+.TP
+.BI "schedule """ "minute hour day-of-month month day-of-week" """"
+Change the schedule. Fields are numeric: numbers, lists (1,15), ranges (1\-5) and steps (*/2, 1\-10/3).
+Quote the expression so the shell does not expand the stars.
+A schedule that fires more than once an hour is refused unless
+.B \-\-force
+is given, because every run writes a full archive.
+.TP
+.BI "schedule \-\-daily " HH:MM
+Run once a day at the given 24-hour time.
+.TP
+.B run
+Run a backup now, whatever the schedule says.
+.TP
+.B list
+List the archives.
+.TP
+.B apply
+Rebuild the cron entry from the configuration file, for example after editing it by hand.
+.SH FILES
+.TP
+.I /etc/linux-backup.conf
+Configuration: ENABLED, SCHEDULE, SOURCES, BACKUP_DIR, RETENTION_DAYS, LOG_FILE.
+.TP
+.I /etc/cron.d/linux-backup
+Generated cron entry.
+.TP
+.I /usr/libexec/linux-backup/backup.sh
+The backup script.
+.TP
+.I /backup
+Default archive directory, mode 700.
+.TP
+.I /var/log/backup.log
+Log of every run.
+.SH EXAMPLES
+.nf
+sudo linux-backup status
+sudo linux-backup disable
+sudo linux-backup enable
+sudo linux-backup schedule "30 3 * * *"
+sudo linux-backup schedule \-\-daily 03:30
+sudo linux-backup schedule "0 2 * * 1\-5"
+sudo linux-backup run
+.fi
+.SH EXIT STATUS
+0 on success, 1 on an error, 2 for an unknown command.
+.SH SEE ALSO
+.BR crontab (5),
+.BR cron (8),
+.BR tar (1),
+.BR find (1)

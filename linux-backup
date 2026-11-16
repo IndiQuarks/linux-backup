@@ -1,0 +1,270 @@
+#!/bin/bash
+# linux-backup: turn scheduled backups on or off, change when they run, run one now.
+# Installed to /usr/sbin/linux-backup. See linux-backup(8).
+
+set -uo pipefail
+
+VERSION="1.0.0"
+CONF="${LINUX_BACKUP_CONF:-/etc/linux-backup.conf}"
+CRON_FILE="${LINUX_BACKUP_CRON:-/etc/cron.d/linux-backup}"
+BACKUP_SCRIPT="${LINUX_BACKUP_SCRIPT:-/usr/libexec/linux-backup/backup.sh}"
+DEFAULT_SCHEDULE="0 2 * * *"
+
+die() { echo "linux-backup: $*" >&2; exit 1; }
+
+usage() {
+    cat <<'EOF'
+Usage: linux-backup <command> [options]
+
+Commands:
+  status                    Show whether backups are enabled, the schedule and the archives
+  enable                    Turn scheduled backups on
+  disable                   Turn scheduled backups off (existing archives are kept)
+  schedule                  Show the current schedule
+  schedule "<cron>"         Change the schedule, e.g. schedule "30 3 * * *"
+  schedule --daily HH:MM    Run once a day at that time, e.g. schedule --daily 03:30
+  run                       Run a backup now, whatever the schedule says
+  list                      List the archives
+  apply                     Rebuild the cron entry from /etc/linux-backup.conf
+  help | version
+
+The cron expression has five numeric fields: minute hour day-of-month month day-of-week.
+Quote it so your shell does not expand the stars. Schedules that fire more than once
+an hour are refused unless you add --force, because every run writes a full archive.
+EOF
+}
+
+# conf_get KEY DEFAULT: read KEY="value" from the config file without executing it
+conf_get() {
+    local line val
+    line="$(grep -E "^[[:space:]]*$1=" "$CONF" 2>/dev/null | tail -n 1)" || true
+    if [[ -z $line ]]; then printf '%s' "$2"; return; fi
+    val="${line#*=}"
+    val="${val#"${val%%[![:space:]]*}"}"
+    val="${val%"${val##*[![:space:]]}"}"
+    val="${val#\"}"; val="${val%\"}"
+    printf '%s' "$val"
+}
+
+load_conf() {
+    [[ -r $CONF ]] || die "cannot read $CONF"
+    ENABLED="$(conf_get ENABLED yes)"
+    SCHEDULE="$(conf_get SCHEDULE "$DEFAULT_SCHEDULE")"
+    BACKUP_DIR="$(conf_get BACKUP_DIR /backup)"
+    LOG_FILE="$(conf_get LOG_FILE /var/log/backup.log)"
+    RETENTION_DAYS="$(conf_get RETENTION_DAYS 7)"
+    if [[ $ENABLED != yes && $ENABLED != no ]]; then die "ENABLED in $CONF must be yes or no"; fi
+}
+
+need_write() {
+    [[ -w $CONF ]] || die "permission denied: run this command with sudo"
+    [[ -w $(dirname "$CRON_FILE") ]] || die "permission denied: run this command with sudo"
+}
+
+# set_conf KEY VALUE: replace KEY="..." in the config file, or append it
+set_conf() {
+    local key=$1 val=$2 tmp
+    tmp="$(mktemp "$(dirname "$CONF")/.linux-backup.conf.XXXXXX")" || die "cannot write next to $CONF"
+    if grep -qE "^[[:space:]]*${key}=" "$CONF"; then
+        awk -v k="$key" -v v="$val" '
+            $0 ~ "^[[:space:]]*" k "=" { print k "=\"" v "\""; next }
+            { print }' "$CONF" > "$tmp"
+    else
+        { cat "$CONF"; printf '%s="%s"\n' "$key" "$val"; } > "$tmp"
+    fi
+    chmod --reference="$CONF" "$tmp"
+    mv -f "$tmp" "$CONF"
+}
+
+# write_cron: regenerate the cron entry from the config file (single source of truth)
+write_cron() {
+    local dir tmp
+    load_conf
+    dir="$(dirname "$CRON_FILE")"
+    tmp="$(mktemp "$dir/.linux-backup.XXXXXX")" || die "cannot write in $dir"
+    {
+        echo "# Managed by linux-backup. Do not edit by hand."
+        echo "# Change it with: linux-backup enable | disable | schedule"
+        echo "SHELL=/bin/bash"
+        echo "PATH=/usr/sbin:/usr/bin:/sbin:/bin"
+        if [[ $ENABLED == yes ]]; then
+            echo "$SCHEDULE root $BACKUP_SCRIPT"
+        else
+            echo "# Scheduled backups are disabled. Turn them on with: linux-backup enable"
+            echo "#$SCHEDULE root $BACKUP_SCRIPT"
+        fi
+    } > "$tmp"
+    chmod 0644 "$tmp"
+    mv -f "$tmp" "$CRON_FILE"
+    if command -v restorecon >/dev/null 2>&1; then restorecon "$CRON_FILE" >/dev/null 2>&1 || :; fi
+}
+
+# validate_field NAME MIN MAX VALUE: one cron field (lists, ranges, steps; numbers only)
+validate_field() {
+    local name=$1 min=$2 max=$3 value=$4 item base step a b
+    local -a items
+    if [[ -z $value || $value == ,* || $value == *, || $value == *,,* ]]; then
+        echo "bad $name field: '$value'"; return 1
+    fi
+    IFS=',' read -r -a items <<< "$value"
+    for item in "${items[@]}"; do
+        if [[ ! $item =~ ^(\*|[0-9]+(-[0-9]+)?)(/[0-9]+)?$ ]]; then
+            echo "bad $name field: '$item' (use numbers, ranges, lists and steps)"; return 1
+        fi
+        base="${item%%/*}"; step=1
+        if [[ $item == */* ]]; then
+            step="${item##*/}"
+            if [[ $base != '*' && $base != *-* ]]; then
+                echo "bad $name field: '$item' (a step needs * or a range)"; return 1
+            fi
+        fi
+        if (( 10#$step < 1 )); then echo "bad $name field: step must be at least 1"; return 1; fi
+        if [[ $base != '*' ]]; then
+            a="${base%%-*}"; b="${base##*-}"
+            if ! (( 10#$a >= min && 10#$a <= max && 10#$b >= min && 10#$b <= max && 10#$a <= 10#$b )); then
+                echo "bad $name field: '$item' (allowed $min to $max)"; return 1
+            fi
+        fi
+    done
+}
+
+# validate_cron "EXPR": prints a normalised expression on success
+validate_cron() {
+    local -a f
+    local err
+    if [[ $1 == *$'\n'* || $1 == *$'\r'* ]]; then
+        echo "a schedule must be on a single line" >&2
+        return 1
+    fi
+    read -r -a f <<< "$1"
+    if (( ${#f[@]} != 5 )); then
+        echo "a schedule needs exactly five fields: minute hour day-of-month month day-of-week" >&2
+        return 1
+    fi
+    err="$(validate_field minute 0 59 "${f[0]}")" || { echo "$err" >&2; return 1; }
+    err="$(validate_field hour 0 23 "${f[1]}")" || { echo "$err" >&2; return 1; }
+    err="$(validate_field day-of-month 1 31 "${f[2]}")" || { echo "$err" >&2; return 1; }
+    err="$(validate_field month 1 12 "${f[3]}")" || { echo "$err" >&2; return 1; }
+    err="$(validate_field day-of-week 0 7 "${f[4]}")" || { echo "$err" >&2; return 1; }
+    echo "${f[*]}"
+}
+
+cron_active() {
+    command -v systemctl >/dev/null 2>&1 || return 2
+    systemctl is-active --quiet crond.service
+}
+
+cmd_status() {
+    local state count size cron_state expected last
+    load_conf
+    [[ $ENABLED == yes ]] && state="enabled" || state="disabled"
+    printf '%-20s %s\n' "Scheduled backups:" "$state"
+    printf '%-20s %s\n' "Schedule:" "$SCHEDULE"
+    printf '%-20s %s\n' "Retention:" "$RETENTION_DAYS days"
+    if cron_active; then cron_state="running"
+    elif [[ $? -eq 2 ]]; then cron_state="unknown (no systemctl)"
+    else cron_state="NOT running (start it with: systemctl enable --now crond)"; fi
+    printf '%-20s %s\n' "Cron service:" "$cron_state"
+    # the cron entry must match the config; flag a stale one
+    expected="$SCHEDULE root $BACKUP_SCRIPT"
+    if [[ $ENABLED == yes ]]; then
+        grep -Fxq "$expected" "$CRON_FILE" 2>/dev/null || echo "Warning: $CRON_FILE does not match the config. Run: linux-backup apply"
+    else
+        if grep -Fxq "$expected" "$CRON_FILE" 2>/dev/null; then echo "Warning: $CRON_FILE still has an active entry. Run: linux-backup apply"; fi
+    fi
+    if [[ -r $BACKUP_DIR && -x $BACKUP_DIR ]]; then
+        count="$(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'backup_*.tar.gz' | wc -l)"
+        size="$(du -shc "$BACKUP_DIR"/backup_*.tar.gz 2>/dev/null | tail -n 1 | cut -f1)"
+        printf '%-20s %s (%s archives, %s)\n' "Backup directory:" "$BACKUP_DIR" "$count" "${size:-0}"
+    else
+        printf '%-20s %s (run with sudo to read it)\n' "Backup directory:" "$BACKUP_DIR"
+    fi
+    if [[ -r $LOG_FILE ]]; then
+        last="$(grep -E 'Backup completed|\[ERROR\]' "$LOG_FILE" | tail -n 1)"
+        printf '%-20s %s\n' "Last result:" "${last:-no runs logged yet}"
+    fi
+}
+
+cmd_enable() {
+    need_write; load_conf
+    set_conf ENABLED yes
+    write_cron
+    echo "Scheduled backups enabled: $(conf_get SCHEDULE "$DEFAULT_SCHEDULE")"
+    cron_active || [[ $? -eq 2 ]] || echo "Note: crond is not running. Start it with: systemctl enable --now crond"
+}
+
+cmd_disable() {
+    need_write; load_conf
+    set_conf ENABLED no
+    write_cron
+    echo "Scheduled backups disabled. Existing archives are kept; a backup that is already running finishes normally."
+}
+
+cmd_schedule() {
+    local force=0 daily="" expr="" norm hh mm
+    local -a words=()
+    if (( $# == 0 )); then load_conf; echo "$SCHEDULE"; return 0; fi
+    while (( $# )); do
+        case "$1" in
+            --force) force=1 ;;
+            --daily) shift; daily="${1:-}"; [[ -n $daily ]] || die "--daily needs a time such as 03:30" ;;
+            -*) die "unknown option $1" ;;
+            *) words+=("$1") ;;
+        esac
+        shift
+    done
+    if [[ -n $daily ]]; then
+        [[ $daily =~ ^([01]?[0-9]|2[0-3]):([0-5][0-9])$ ]] || die "--daily needs a 24-hour time such as 03:30"
+        hh="${daily%%:*}"; mm="${daily##*:}"
+        expr="$((10#$mm)) $((10#$hh)) * * *"
+        (( ${#words[@]} == 0 )) || die "give either --daily HH:MM or a cron expression, not both"
+    else
+        expr="${words[*]:-}"
+        [[ -n $expr ]] || die "missing schedule. Example: linux-backup schedule \"30 3 * * *\""
+    fi
+    norm="$(validate_cron "$expr")" || die "invalid schedule: $expr"
+    # refuse sub-hourly schedules unless forced: each run writes a full archive
+    if [[ ! ${norm%% *} =~ ^[0-9]+$ ]] && (( force == 0 )); then
+        die "'$norm' runs more than once an hour, and every run writes a full archive. Add --force if you really want that."
+    fi
+    need_write; load_conf
+    set_conf SCHEDULE "$norm"
+    write_cron
+    if [[ $ENABLED == yes ]]; then
+        echo "Schedule changed to: $norm"
+    else
+        echo "Schedule saved as: $norm"
+        echo "Backups are currently disabled. Turn them on with: linux-backup enable"
+    fi
+}
+
+cmd_run() {
+    [[ -x $BACKUP_SCRIPT ]] || die "cannot run $BACKUP_SCRIPT (run this command with sudo)"
+    exec "$BACKUP_SCRIPT"
+}
+
+cmd_list() {
+    load_conf
+    [[ -r $BACKUP_DIR && -x $BACKUP_DIR ]] || die "cannot read $BACKUP_DIR (run this command with sudo)"
+    ls -lh -- "$BACKUP_DIR"
+}
+
+cmd_apply() {
+    need_write
+    write_cron
+    echo "Cron entry rebuilt from $CONF"
+}
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+    status)   cmd_status "$@" ;;
+    enable)   cmd_enable "$@" ;;
+    disable)  cmd_disable "$@" ;;
+    schedule) cmd_schedule "$@" ;;
+    run)      cmd_run "$@" ;;
+    list)     cmd_list "$@" ;;
+    apply)    cmd_apply "$@" ;;
+    version|--version|-V) echo "linux-backup $VERSION" ;;
+    help|--help|-h) usage ;;
+    *) usage >&2; exit 2 ;;
+esac
